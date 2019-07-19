@@ -2553,7 +2553,8 @@ smtp_session_nomaxsize_test_() ->
 								?assertMatch("250 " ++ _, Packet3)
 						end
 					}
-			end		]
+			end
+		]
 	}.
 
 -endif.
