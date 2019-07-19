@@ -177,12 +177,12 @@ handle_info({receive_data, Body, Rest}, #state{socket = Socket, readmessage = tr
 	UnescapedBody = re:replace(Body, <<"^\\\.">>, <<>>, [global, multiline, {return, binary}]),
 	Envelope = Env#envelope{data = UnescapedBody},
 	case byte_size(Envelope#envelope.data) > MaxSize of
-		true ->
+		true when MaxSize =/= 0 ->
 			smtp_socket:send(Socket, "552 Message too large\r\n"),
 			smtp_socket:active_once(Socket),
 			% might not even be able to get here anymore...
 			{noreply, State#state{readmessage = false, envelope = #envelope{}}, ?TIMEOUT};
-		false ->
+		_ ->
 			case Module:handle_DATA(Envelope#envelope.from, Envelope#envelope.to, Envelope#envelope.data, OldCallbackState) of
 				{ok, Reference, CallbackState} ->
 					smtp_socket:send(Socket, io_lib:format("250 queued as ~s\r\n", [Reference])),
@@ -741,11 +741,11 @@ try_auth(AuthType, Username, Credential, #state{module = Module, socket = Socket
 
 %% @doc a tight loop to receive the message body
 receive_data(_Acc, _Socket, _, Size, MaxSize, Session, _Options) when MaxSize > 0, Size > MaxSize ->
-	error_logger:info_msg("message body size ~B exceeded maximum allowed ~B~n", [Size, MaxSize]),
+	error_logger:info_msg("SMTP message body size ~B exceeded maximum allowed ~B~n", [Size, MaxSize]),
 	Session ! {receive_data, {error, size_exceeded}};
 receive_data(Acc, Socket, RecvSize, Size, MaxSize, Session, Options) ->
 	case smtp_socket:recv(Socket, RecvSize, 1000) of
-		{ok, Packet} when Acc == [] ->
+		{ok, Packet} when Acc =:= [] ->
 			case check_bare_crlf(Packet, <<>>, proplists:get_value(allow_bare_newlines, Options, false), 0) of
 				error ->
 					Session ! {receive_data, {error, bare_newline}};
@@ -2251,5 +2251,211 @@ stray_newline_test_() ->
 		}
 	].
 
+
+smtp_session_maxsize_test_() ->
+	{foreach,
+		local,
+		fun() ->
+				Self = self(),
+				spawn(fun() ->
+							{ok, ListenSock} = smtp_socket:listen(tcp, 9876, [binary]),
+							{ok, X} = smtp_socket:accept(ListenSock),
+							smtp_socket:controlling_process(X, Self),
+							Self ! X
+					end),
+				{ok, CSock} = smtp_socket:connect(tcp, "localhost", 9876),
+				receive
+					SSock when is_port(SSock) ->
+						ok
+				end,
+				ServerOptions = [
+					{hostname, "localhost"},
+					{sessioncount, 1},
+					{callbackoptions, [{size, 100}]}
+				],
+				{ok, Pid} = gen_smtp_server_session:start(SSock, smtp_server_example, ServerOptions),
+				smtp_socket:controlling_process(SSock, Pid),
+				{CSock, Pid}
+		end,
+		fun({CSock, _Pid}) ->
+				smtp_socket:close(CSock)
+		end,
+		[
+			fun({CSock, _Pid}) ->
+					{"Message with ok size",
+						fun() ->
+								smtp_socket:active_once(CSock),
+								receive {tcp, CSock, Packet} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("220 localhost"++_Stuff,  Packet),
+								smtp_socket:send(CSock, "EHLO somehost.com\r\n"),
+								receive {tcp, CSock, Packet2} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("250-localhost\r\n",  Packet2),
+								Foo = fun(F, Acc) ->
+										receive
+											{tcp, CSock, "250-SIZE 100\r\n"} ->
+												smtp_socket:active_once(CSock),
+												F(F, true);
+											{tcp, CSock, "250-SIZE"++_} ->
+												error;
+											{tcp, CSock, "250-"++_} ->
+												smtp_socket:active_once(CSock),
+												F(F, Acc);
+											{tcp, CSock, "250 PIPELINING"++_} ->
+												smtp_socket:active_once(CSock),
+												true;
+											{tcp, CSock, _} ->
+												smtp_socket:active_once(CSock),
+												error
+										end
+								end,
+								?assertEqual(true, Foo(Foo, false)),
+								smtp_socket:send(CSock, "MAIL FROM:<user@otherhost>\r\n"),
+								receive {tcp, CSock, Packet3} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("250 " ++ _, Packet3),
+								smtp_socket:send(CSock, "RCPT TO:<test@somehost.com>\r\n"),
+								receive {tcp, CSock, Packet4} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("250 " ++ _, Packet4),
+								smtp_socket:send(CSock, "DATA\r\n"),
+								receive {tcp, CSock, Packet5} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("354 " ++ _, Packet5),
+								smtp_socket:send(CSock, "Subject: tls message\r\n"),
+								smtp_socket:send(CSock, "To: <user@otherhost>\r\n"),
+								smtp_socket:send(CSock, "From: <user@somehost.com>\r\n"),
+								smtp_socket:send(CSock, "\r\n"),
+								smtp_socket:send(CSock, "message body"),
+								smtp_socket:send(CSock, "\r\n.\r\n"),
+								receive {tcp, CSock, Packet7} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("250 "++_, Packet7)
+						end
+					}
+			end,
+			fun({CSock, _Pid}) ->
+					{"Message with too large size",
+						fun() ->
+								smtp_socket:active_once(CSock),
+								receive {tcp, CSock, Packet} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("220 localhost"++_Stuff,  Packet),
+								smtp_socket:send(CSock, "EHLO somehost.com\r\n"),
+								receive {tcp, CSock, Packet2} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("250-localhost\r\n",  Packet2),
+								Foo = fun(F, Acc) ->
+										receive
+											{tcp, CSock, "250-SIZE 100\r\n"} ->
+												smtp_socket:active_once(CSock),
+												F(F, true);
+											{tcp, CSock, "250-SIZE"++_} ->
+												error;
+											{tcp, CSock, "250-"++_} ->
+												smtp_socket:active_once(CSock),
+												F(F, Acc);
+											{tcp, CSock, "250 PIPELINING"++_} ->
+												smtp_socket:active_once(CSock),
+												true;
+											{tcp, CSock, _} ->
+												smtp_socket:active_once(CSock),
+												error
+										end
+								end,
+								?assertEqual(true, Foo(Foo, false)),
+								smtp_socket:send(CSock, "MAIL FROM:<user@otherhost>\r\n"),
+								receive {tcp, CSock, Packet3} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("250 " ++ _, Packet3),
+								smtp_socket:send(CSock, "RCPT TO:<test@somehost.com>\r\n"),
+								receive {tcp, CSock, Packet4} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("250 " ++ _, Packet4),
+								smtp_socket:send(CSock, "DATA\r\n"),
+								receive {tcp, CSock, Packet5} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("354 " ++ _, Packet5),
+								smtp_socket:send(CSock, "Subject: tls message\r\n"),
+								smtp_socket:send(CSock, "To: <user@otherhost>\r\n"),
+								smtp_socket:send(CSock, "From: <user@somehost.com>\r\n"),
+								smtp_socket:send(CSock, "\r\n"),
+								smtp_socket:send(CSock, "message body message body message body message body message body"),
+								smtp_socket:send(CSock, "message body message body message body message body message body"),
+								smtp_socket:send(CSock, "\r\n.\r\n"),
+								receive {tcp, CSock, Packet7} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("552 "++_, Packet7)
+						end
+					}
+			end
+		]
+	}.
+
+smtp_session_nomaxsize_test_() ->
+	{foreach,
+		local,
+		fun() ->
+				Self = self(),
+				spawn(fun() ->
+							{ok, ListenSock} = smtp_socket:listen(tcp, 9876, [binary]),
+							{ok, X} = smtp_socket:accept(ListenSock),
+							smtp_socket:controlling_process(X, Self),
+							Self ! X
+					end),
+				{ok, CSock} = smtp_socket:connect(tcp, "localhost", 9876),
+				receive
+					SSock when is_port(SSock) ->
+						ok
+				end,
+				ServerOptions = [
+					{hostname, "localhost"},
+					{sessioncount, 1},
+					{callbackoptions, [{size, 0}]}
+				],
+				{ok, Pid} = gen_smtp_server_session:start(SSock, smtp_server_example, ServerOptions),
+				smtp_socket:controlling_process(SSock, Pid),
+				{CSock, Pid}
+		end,
+		fun({CSock, _Pid}) ->
+				smtp_socket:close(CSock)
+		end,
+		[
+			fun({CSock, _Pid}) ->
+					{"Message with no max size",
+						fun() ->
+								smtp_socket:active_once(CSock),
+								receive {tcp, CSock, Packet} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("220 localhost"++_Stuff,  Packet),
+								smtp_socket:send(CSock, "EHLO somehost.com\r\n"),
+								receive {tcp, CSock, Packet2} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("250-localhost\r\n",  Packet2),
+								Foo = fun(F, Acc) ->
+										receive
+											{tcp, CSock, "250-SIZE"++_} ->
+												error;
+											{tcp, CSock, "250-"++_} ->
+												smtp_socket:active_once(CSock),
+												F(F, Acc);
+											{tcp, CSock, "250 PIPELINING"++_} ->
+												smtp_socket:active_once(CSock),
+												true;
+											{tcp, CSock, _} ->
+												smtp_socket:active_once(CSock),
+												error
+										end
+								end,
+								?assertEqual(true, Foo(Foo, false)),
+								smtp_socket:send(CSock, "MAIL FROM:<user@otherhost>\r\n"),
+								receive {tcp, CSock, Packet3} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("250 " ++ _, Packet3),
+								smtp_socket:send(CSock, "RCPT TO:<test@somehost.com>\r\n"),
+								receive {tcp, CSock, Packet4} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("250 " ++ _, Packet4),
+								smtp_socket:send(CSock, "DATA\r\n"),
+								receive {tcp, CSock, Packet5} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("354 " ++ _, Packet5),
+								smtp_socket:send(CSock, "Subject: tls message\r\n"),
+								smtp_socket:send(CSock, "To: <user@otherhost>\r\n"),
+								smtp_socket:send(CSock, "From: <user@somehost.com>\r\n"),
+								smtp_socket:send(CSock, "\r\n"),
+								smtp_socket:send(CSock, "message body"),
+								smtp_socket:send(CSock, "\r\n.\r\n"),
+								receive {tcp, CSock, Packet7} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("250 "++_, Packet7)
+						end
+					}
+			end
+		]
+	}.
 
 -endif.

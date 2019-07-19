@@ -77,14 +77,20 @@ handle_EHLO(<<"invalid">>, _Extensions, State) ->
 handle_EHLO(Hostname, Extensions, State) ->
 	io:format("EHLO from ~s~n", [Hostname]),
 	% You can advertise additional extensions, or remove some defaults
-	MyExtensions = case proplists:get_value(auth, State#state.options, false) of
+	MyExtensions1 = case proplists:get_value(auth, State#state.options, false) of
 		true ->
 			% auth is enabled, so advertise it
 			Extensions ++ [{"AUTH", "PLAIN LOGIN CRAM-MD5"}, {"STARTTLS", true}];
 		false ->
 			Extensions
 	end,
-	{ok, MyExtensions, State}.
+	MyExtensions2 = case proplists:get_value(size, State#state.options) of
+		undefined ->
+			MyExtensions1;
+		Size when is_integer(Size) ->
+			[ {"SIZE", integer_to_list(Size)} | lists:keydelete("SIZE", 1, MyExtensions1) ]
+	end,
+	{ok, MyExtensions2, State}.
 
 %% @doc Handle the MAIL FROM verb. The From argument is the email address specified by the
 %% MAIL FROM command. Extensions to the MAIL verb are handled by the `handle_MAIL_extension'
