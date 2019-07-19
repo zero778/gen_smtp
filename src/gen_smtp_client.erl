@@ -259,9 +259,15 @@ send_it(Email, Options) ->
 		{error, _, _} = Error ->
 			Error;
 		{Socket, Extensions, Options1} ->
-			Receipt = try_sending_it(Email, Socket, Extensions, Options1),
-			quit(Socket),
-			Receipt
+            try
+    			Receipt = try_sending_it(Email, Socket, Extensions, Options1),
+    			quit(Socket),
+    			Receipt
+            catch
+                throw:{_, _} = FailMsg ->
+                    smtp_socket:close(Socket),
+                    {error, retries_exceeded, FailMsg}
+            end
 	end.
 
 -spec try_smtp_sessions(Hosts :: [{non_neg_integer(), string()}, ...], Options :: options(), RetryList :: list()) ->
