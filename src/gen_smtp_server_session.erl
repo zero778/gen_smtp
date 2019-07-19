@@ -280,9 +280,12 @@ handle_request({<<"HELO">>, <<>>}, #state{socket = Socket} = State) ->
 	{ok, State};
 handle_request({<<"HELO">>, Hostname}, #state{socket = Socket, options = Options, module = Module, callbackstate = OldCallbackState} = State) ->
 	case Module:handle_HELO(Hostname, OldCallbackState) of
+		{ok, 0, CallbackState} ->
+			smtp_socket:send(Socket,["250 ", proplists:get_value(hostname, Options, smtp_util:guess_FQDN()), "\r\n"]),
+			{ok, State#state{maxsize = 0, envelope = #envelope{}, callbackstate = CallbackState}};
 		{ok, MaxSize, CallbackState} when is_integer(MaxSize) ->
 			smtp_socket:send(Socket,["250 ", proplists:get_value(hostname, Options, smtp_util:guess_FQDN()), "\r\n"]),
-			{ok, State#state{extensions = [{"SIZE", integer_to_list(MaxSize)}], envelope = #envelope{}, callbackstate = CallbackState}};
+			{ok, State#state{maxsize = MaxSize, envelope = #envelope{}, callbackstate = CallbackState}};
 		{ok, CallbackState} ->
 			smtp_socket:send(Socket, ["250 ", proplists:get_value(hostname, Options, smtp_util:guess_FQDN()), "\r\n"]),
 			{ok, State#state{envelope = #envelope{}, callbackstate = CallbackState}};
@@ -464,16 +467,11 @@ handle_request({<<"MAIL">>, Args},
 								 (<<"SIZE=", Size/binary>>, InnerState) when MaxSize =:= 0 ->
 									InnerState#state{envelope = Envelope#envelope{expectedsize = binary_to_integer(Size)}};
 								 (<<"SIZE=", Size/binary>>, InnerState) ->
-									case has_extension(Extensions, "SIZE") of
-										{true, Value} ->
-											case list_to_integer(binary_to_list(Size)) > list_to_integer(Value) of
-												true ->
-													{error, ["552 Estimated message length ", Size, " exceeds limit of ", Value, "\r\n"]};
-												false ->
-													InnerState#state{envelope = Envelope#envelope{expectedsize = binary_to_integer(Size)}}
-											end;
+									case binary_to_integer(Size) > MaxSize of
+										true ->
+											{error, ["552 Estimated message length ", Size, " exceeds limit of ", integer_to_binary(MaxSize), "\r\n"]};
 										false ->
-											{error, "555 Unsupported option SIZE\r\n"}
+											InnerState#state{envelope = Envelope#envelope{expectedsize = binary_to_integer(Size)}}
 									end;
 								(<<"BODY=", _BodyType/binary>>, InnerState) ->
 									case has_extension(Extensions, "8BITMIME") of
@@ -2377,8 +2375,75 @@ smtp_session_maxsize_test_() ->
 								?assertMatch("552 "++_, Packet7)
 						end
 					}
-			end
-		]
+			end,
+			fun({CSock, _Pid}) ->
+					{"Message with ok size in FROM extension",
+						fun() ->
+								smtp_socket:active_once(CSock),
+								receive {tcp, CSock, Packet} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("220 localhost"++_Stuff,  Packet),
+								smtp_socket:send(CSock, "EHLO somehost.com\r\n"),
+								receive {tcp, CSock, Packet2} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("250-localhost\r\n",  Packet2),
+								Foo = fun(F, Acc) ->
+										receive
+											{tcp, CSock, "250-SIZE 100\r\n"} ->
+												smtp_socket:active_once(CSock),
+												F(F, true);
+											{tcp, CSock, "250-SIZE"++_} ->
+												error;
+											{tcp, CSock, "250-"++_} ->
+												smtp_socket:active_once(CSock),
+												F(F, Acc);
+											{tcp, CSock, "250 PIPELINING"++_} ->
+												smtp_socket:active_once(CSock),
+												true;
+											{tcp, CSock, _} ->
+												smtp_socket:active_once(CSock),
+												error
+										end
+								end,
+								?assertEqual(true, Foo(Foo, false)),
+								smtp_socket:send(CSock, "MAIL FROM:<user@otherhost> SIZE=100\r\n"),
+								receive {tcp, CSock, Packet3} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("250 " ++ _, Packet3)
+						end
+					}
+			end,
+			fun({CSock, _Pid}) ->
+					{"Message with not ok size in FROM extension",
+						fun() ->
+								smtp_socket:active_once(CSock),
+								receive {tcp, CSock, Packet} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("220 localhost"++_Stuff,  Packet),
+								smtp_socket:send(CSock, "EHLO somehost.com\r\n"),
+								receive {tcp, CSock, Packet2} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("250-localhost\r\n",  Packet2),
+								Foo = fun(F, Acc) ->
+										receive
+											{tcp, CSock, "250-SIZE 100\r\n"} ->
+												smtp_socket:active_once(CSock),
+												F(F, true);
+											{tcp, CSock, "250-SIZE"++_} ->
+												error;
+											{tcp, CSock, "250-"++_} ->
+												smtp_socket:active_once(CSock),
+												F(F, Acc);
+											{tcp, CSock, "250 PIPELINING"++_} ->
+												smtp_socket:active_once(CSock),
+												true;
+											{tcp, CSock, _} ->
+												smtp_socket:active_once(CSock),
+												error
+										end
+								end,
+								?assertEqual(true, Foo(Foo, false)),
+								smtp_socket:send(CSock, "MAIL FROM:<user@otherhost> SIZE=101\r\n"),
+								receive {tcp, CSock, Packet3} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("552 " ++ _, Packet3)
+						end
+					}
+			end		]
 	}.
 
 smtp_session_nomaxsize_test_() ->
@@ -2454,8 +2519,41 @@ smtp_session_nomaxsize_test_() ->
 								?assertMatch("250 "++_, Packet7)
 						end
 					}
-			end
-		]
+			end,
+			fun({CSock, _Pid}) ->
+					{"Message with ok huge size in FROM extension",
+						fun() ->
+								smtp_socket:active_once(CSock),
+								receive {tcp, CSock, Packet} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("220 localhost"++_Stuff,  Packet),
+								smtp_socket:send(CSock, "EHLO somehost.com\r\n"),
+								receive {tcp, CSock, Packet2} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("250-localhost\r\n",  Packet2),
+								Foo = fun(F, Acc) ->
+										receive
+											{tcp, CSock, "250-SIZE 100\r\n"} ->
+												smtp_socket:active_once(CSock),
+												F(F, true);
+											{tcp, CSock, "250-SIZE"++_} ->
+												error;
+											{tcp, CSock, "250-"++_} ->
+												smtp_socket:active_once(CSock),
+												F(F, Acc);
+											{tcp, CSock, "250 PIPELINING"++_} ->
+												smtp_socket:active_once(CSock),
+												true;
+											{tcp, CSock, _} ->
+												smtp_socket:active_once(CSock),
+												error
+										end
+								end,
+								?assertEqual(true, Foo(Foo, false)),
+								smtp_socket:send(CSock, "MAIL FROM:<user@otherhost> SIZE=100000000\r\n"),
+								receive {tcp, CSock, Packet3} -> smtp_socket:active_once(CSock) end,
+								?assertMatch("250 " ++ _, Packet3)
+						end
+					}
+			end		]
 	}.
 
 -endif.

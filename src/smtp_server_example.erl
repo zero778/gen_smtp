@@ -60,7 +60,9 @@ handle_HELO(<<"trusted_host">>, State) ->
 	{ok, State}; %% no size limit because we trust them.
 handle_HELO(Hostname, State) ->
 	io:format("HELO from ~s~n", [Hostname]),
-	{ok, 655360, State}. % 640kb of HELO should be enough for anyone.
+	% 640kb of HELO should be enough for anyone.
+	MaxSize = proplists:get_value(size, State#state.options, 655360),
+	{ok, MaxSize, State}.
 	%If {ok, State} was returned here, we'd use the default 10mb limit
 
 %% @doc Handle the EHLO verb from the client. As with EHLO the hostname is provided as an argument,
