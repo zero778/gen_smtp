@@ -48,6 +48,7 @@
                               {packet, line},
                               {ip, {0,0,0,0}},
                               {versions, ['tlsv1', 'tlsv1.1', 'tlsv1.2']},
+                              {ciphers, ssl:cipher_suites(all)},
                               {port, 0}]).
 
 -ifdef(TEST).
